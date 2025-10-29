@@ -5,29 +5,34 @@ GO
 USE Torrid_AMS;
 GO
 
-CREATE TABLE incidents(
-   Number VARCHAR(20) PRIMARY KEY,
-   Opened DATETIME,
-   Short_description TEXT,
-   Caller VARCHAR(100),
-   Priority VARCHAR(50),
-   State VARCHAR(50),
-   Category VARCHAR(100),
-   Assignment_group VARCHAR(100),
-   Assigned_to VARCHAR(100),
-   Updated DATETIME,
-   Updated_by VARCHAR(100),
-   Child_Incidents INT,
-   SLA_due VARCHAR(20) NULL,
-   Severity VARCHAR(50),
-   Subcategory VARCHAR(100),
-   Resolution_notes TEXT,
-   Resolved DATETIME,
-   SLA_Calculation VARCHAR(20) NULL,
-   Parent_Incident VARCHAR(20) NULL,
-   Parent VARCHAR(100),
-   Task_type VARCHAR(50)
-);
+CREATE TABLE [dbo].[Incidents](
+	[Number] [nvarchar](50) NOT NULL,
+	[Opened] [datetime] NULL,
+	[Short_description] [nvarchar](max) NULL,
+	[Caller] [nvarchar](100) NULL,
+	[Priority] [nvarchar](50) NULL,
+	[State] [nvarchar](50) NULL,
+	[Category] [nvarchar](100) NULL,
+	[Assignment_group] [nvarchar](100) NULL,
+	[Assigned_to] [nvarchar](100) NULL,
+	[Updated] [datetime] NULL,
+	[Updated_by] [nvarchar](100) NULL,
+	[Child_Incidents] [nvarchar](max) NULL,
+	[SLA_due] [nvarchar](50) NULL,
+	[Severity] [nvarchar](50) NULL,
+	[Subcategory] [nvarchar](100) NULL,
+	[Resolution_notes] [nvarchar](max) NULL,
+	[Resolved] [datetime] NULL,
+	[SLA_Calculation] [nvarchar](50) NULL,
+	[Parent_Incident] [nvarchar](50) NULL,
+	[Parent] [nvarchar](50) NULL,
+	[Task_type] [nvarchar](100) NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[Number] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
 
 CREATE TABLE Users (
     UserID INT IDENTITY(1,1) PRIMARY KEY,       -- Unique user ID
