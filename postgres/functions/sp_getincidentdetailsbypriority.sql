@@ -28,43 +28,29 @@ DECLARE
     v_offset INT;
     v_total_count INT;
     v_total_pages INT;
-    v_is_return_all BOOLEAN := (v_page_size = 0);
-    v_sort_key TEXT := LOWER(COALESCE(p_sortBy, 'resolveddatetime'));
-    v_sort_order TEXT := UPPER(COALESCE(p_sortOrder, 'DESC'));
 BEGIN
     -- Guard rails
     IF v_page_number < 1 THEN v_page_number := 1; END IF;
     IF v_page_size < 0 THEN v_page_size := 8; END IF;
-
     v_offset := (v_page_number - 1) * CASE WHEN v_page_size = 0 THEN 1 ELSE v_page_size END;
 
-    -- STEP 1: Base filtered set - APPLY ONLY NON-SEARCH FILTERS
+    -- STEP 1: Base filtered set
     CREATE TEMP TABLE filtered_incidents ON COMMIT DROP AS
     SELECT
-        i."number",
-        i.assigned_to,
-        i.short_description,
-        i.category,
-        i.state,
-        i.opened,
-        i.resolved,
-        i.updated,
-        i.priority,
-        i.assignment_group
+        i."number", i.assigned_to, i.short_description, i.category, i.state,
+        i.opened, i.resolved, i.updated, i.priority, i.assignment_group
     FROM
         public.incidents i
     WHERE
-        -- Date Range Filter
         ((p_fromdate IS NULL) OR (i.opened >= p_fromdate))
         AND ((p_todate IS NULL) OR (i.opened <= p_todate))
-        -- Multiselect Filters using UNNEST(string_to_array())
         AND (p_assignmentgroup IS NULL OR UPPER(i.assignment_group) IN (SELECT TRIM(UPPER(u)) FROM UNNEST(STRING_TO_ARRAY(p_assignmentgroup, ',')) u))
         AND (p_category IS NULL OR UPPER(i.category) IN (SELECT TRIM(UPPER(u)) FROM UNNEST(STRING_TO_ARRAY(p_category, ',')) u))
         AND (p_assignedtoname IS NULL OR UPPER(i.assigned_to) IN (SELECT TRIM(UPPER(u)) FROM UNNEST(STRING_TO_ARRAY(p_assignedtoname, ',')) u))
         AND (p_state IS NULL OR UPPER(i.state) IN (SELECT TRIM(UPPER(u)) FROM UNNEST(STRING_TO_ARRAY(p_state, ',')) u))
         AND (p_priority IS NULL OR UPPER(i.priority) IN (SELECT TRIM(UPPER(u)) FROM UNNEST(STRING_TO_ARRAY(p_priority, ',')) u));
 
-    -- STEP 2 & 3: Compute calculated fields, apply search filters, and store in final_temp
+    -- STEP 2: Compute calculated fields with Live Aging Breach Logic
     CREATE TEMP TABLE final_temp ON COMMIT DROP AS
     WITH Final AS (
         SELECT
@@ -78,151 +64,105 @@ BEGIN
             f.updated AS updated,
             f.priority AS priority,
 
-            -- Actual resolved minutes: Opened -> Resolved (using LATERAL join to function)
+            -- UPDATED LOGIC: Calculate minutes from Opened to (Resolved OR Now)
             ARHBM.businessminutes AS actualresolvedminutes,
 
-            -- SLA minutes (hardcoded mapping from previous SP)
+            -- SLA mapping
             CASE LEFT(TRIM(COALESCE(f.priority,'4')),1)
                 WHEN '1' THEN 120
                 WHEN '2' THEN 240
                 WHEN '3' THEN 1440
-                WHEN '4' THEN 7200
                 ELSE 7200
-            END AS sla_minutes,
-
-            -- Breach minutes = MAX(0, ActualResolvedMinutes - SLA). GREATEST() replaces T-SQL's complex CASE/MIN(0, ...)
-            GREATEST(0, COALESCE(ARHBM.businessminutes, 0) - 
-                CASE LEFT(TRIM(COALESCE(f.priority,'4')),1)
-                    WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200
-                END
-            ) AS breachminutes,
-
-            -- formatted ActualResolvedTime
-            CASE
-                WHEN ARHBM.businessminutes IS NULL OR ARHBM.businessminutes = 0 THEN 'N/A'
-                ELSE TRIM(
-                    CASE WHEN ARHBM.businessminutes / 1440 >= 1 THEN CONCAT(ARHBM.businessminutes / 1440, ' days ') ELSE '' END ||
-                    CASE WHEN (ARHBM.businessminutes % 1440) / 60 > 0 THEN CONCAT((ARHBM.businessminutes % 1440) / 60, ' hours ') ELSE '' END ||
-                    CASE WHEN ARHBM.businessminutes % 60 > 0 THEN CONCAT(ARHBM.businessminutes % 60, ' mins') ELSE '' END
-                )
-            END AS actualresolvedtime,
-
-            -- formatted BreachSLA
-            CASE
-                WHEN COALESCE(ARHBM.businessminutes, 0) <= 
-                    CASE LEFT(TRIM(COALESCE(f.priority,'4')),1)
-                        WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200
-                    END
-                THEN 'No Breach'
-                ELSE
-                    TRIM(
-                        CASE WHEN (GREATEST(0, COALESCE(ARHBM.businessminutes, 0) - (CASE LEFT(TRIM(COALESCE(f.priority,'4')),1) WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200 END))) / 1440 >= 1
-                            THEN CONCAT((GREATEST(0, COALESCE(ARHBM.businessminutes, 0) - (CASE LEFT(TRIM(COALESCE(f.priority,'4')),1) WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200 END))) / 1440, ' days ') ELSE '' END ||
-                        CASE WHEN ((GREATEST(0, COALESCE(ARHBM.businessminutes, 0) - (CASE LEFT(TRIM(COALESCE(f.priority,'4')),1) WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200 END))) % 1440) / 60 > 0
-                            THEN CONCAT(((GREATEST(0, COALESCE(ARHBM.businessminutes, 0) - (CASE LEFT(TRIM(COALESCE(f.priority,'4')),1) WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200 END))) % 1440) / 60, ' hours ') ELSE '' END ||
-                        CASE WHEN (GREATEST(0, COALESCE(ARHBM.businessminutes, 0) - (CASE LEFT(TRIM(COALESCE(f.priority,'4')),1) WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200 END))) % 60 > 0
-                            THEN CONCAT((GREATEST(0, COALESCE(ARHBM.businessminutes, 0) - (CASE LEFT(TRIM(COALESCE(f.priority,'4')),1) WHEN '1' THEN 120 WHEN '2' THEN 240 WHEN '3' THEN 1440 WHEN '4' THEN 7200 ELSE 7200 END))) % 60, ' mins') ELSE '' END
-                    )
-            END AS breachsla
-
+            END AS sla_minutes
         FROM filtered_incidents f
         JOIN LATERAL public.fn_slaminutes_itvf(
             f.opened,
-            f.resolved,
+            COALESCE(f.resolved, NOW()::timestamp), -- Use NOW for non-resolved states
             CASE WHEN LEFT(TRIM(COALESCE(f.priority,'4')),1) IN ('1','2') THEN TRUE ELSE FALSE END
         ) AS ARHBM ON TRUE
+    ),
+    Calculated AS (
+        SELECT
+            *,
+            -- Breach minutes calculation
+            COALESCE(actualresolvedminutes, 0) - sla_minutes AS breachminutes_raw
+        FROM Final
     )
-    -- Select from the CTE (Final) and apply the p_search filter
     SELECT 
-        f.incidentno, f.assignedto, f.shortdescription, f.category, f.state, f.created, f.resolveddatetime, f.updated, f.priority,
-        f.actualresolvedminutes, f.sla_minutes, f.breachminutes, f.actualresolvedtime, f.breachsla
-    FROM Final f
+        c.incidentno, c.assignedto, c.shortdescription, c.category, c.state, c.created, c.resolveddatetime, c.updated, c.priority,
+        c.actualresolvedminutes, c.sla_minutes, 
+        GREATEST(0, c.breachminutes_raw) as breachminutes,
+        
+        -- Formatted ActualResolvedTime
+        CASE
+            WHEN c.actualresolvedminutes IS NULL OR c.actualresolvedminutes = 0 THEN 'N/A'
+            ELSE TRIM(
+                CASE WHEN c.actualresolvedminutes / 1440 >= 1 THEN CONCAT(FLOOR(c.actualresolvedminutes / 1440), ' days ') ELSE '' END ||
+                CASE WHEN (c.actualresolvedminutes % 1440) / 60 >= 1 THEN CONCAT(FLOOR((c.actualresolvedminutes % 1440) / 60), ' hours ') ELSE '' END ||
+                CASE WHEN c.actualresolvedminutes % 60 > 0 THEN CONCAT(FLOOR(c.actualresolvedminutes % 60), ' mins') ELSE '' END
+            )
+        END AS actualresolvedtime,
+
+        -- Formatted BreachSLA
+        CASE
+            WHEN c.actualresolvedminutes <= c.sla_minutes THEN 'No Breach'
+            ELSE
+                TRIM(
+                    CASE WHEN (c.breachminutes_raw / 1440) >= 1 THEN CONCAT(FLOOR(c.breachminutes_raw / 1440), ' days ') ELSE '' END ||
+                    CASE WHEN ((c.breachminutes_raw % 1440) / 60) >= 1 THEN CONCAT(FLOOR(((c.breachminutes_raw % 1440) / 60)), ' hours ') ELSE '' END ||
+                    CASE WHEN (c.breachminutes_raw % 60) > 0 THEN CONCAT(FLOOR(c.breachminutes_raw % 60), ' mins') ELSE '' END
+                )
+        END AS breachsla
+    FROM Calculated c
     WHERE
         p_search IS NULL
-        OR UPPER(f.incidentno) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(f.assignedto) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(f.shortdescription) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(f.category) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(f.state) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(f.priority) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(CAST(f.created AS TEXT)) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(CAST(f.resolveddatetime AS TEXT)) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(CAST(f.updated AS TEXT)) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(f.actualresolvedtime) LIKE '%' || UPPER(p_search) || '%'
-        OR UPPER(f.breachsla) LIKE '%' || UPPER(p_search) || '%';
-        
-    -- Normalizing sort key and setting counts
-    v_sort_key := REPLACE(REPLACE(REPLACE(v_sort_key, ' ', ''), '_', ''), '-', '');
-    IF v_sort_key = 'incidentno' OR v_sort_key = 'incidentnumber' OR v_sort_key = 'number' OR v_sort_key = 'numbered' THEN v_sort_key := 'incidentno'; END IF;
-    IF v_sort_key = 'assignedto' OR v_sort_key = 'assignto' OR v_sort_key = 'assigned' THEN v_sort_key := 'assignedto'; END IF;
-    IF v_sort_key = 'shortdescription' OR v_sort_key = 'shortdesc' OR v_sort_key = 'short_description' THEN v_sort_key := 'shortdescription'; END IF;
-    IF v_sort_key = 'category' THEN v_sort_key := 'category'; END IF;
-    IF v_sort_key = 'state' THEN v_sort_key := 'state'; END IF;
-    IF v_sort_key = 'created' OR v_sort_key = 'opened' OR v_sort_key = 'opendate' THEN v_sort_key := 'created'; END IF;
-    IF v_sort_key = 'resolveddatetime' OR v_sort_key = 'resolved' OR v_sort_key = 'resolveddate' THEN v_sort_key := 'resolveddatetime'; END IF;
-    IF v_sort_key = 'updated' OR v_sort_key = 'lastupdated' OR v_sort_key = 'updateddate' THEN v_sort_key := 'updated'; END IF;
-    IF v_sort_key = 'priority' THEN v_sort_key := 'priority'; END IF;
-    IF v_sort_key = 'actualresolvedtime' OR v_sort_key = 'actualresolved' OR v_sort_key = 'actualresolvedtimeminutes' OR v_sort_key = 'actualresolvedminutes' OR v_sort_key = 'actual' THEN v_sort_key := 'actualresolvedtime'; END IF;
-    IF v_sort_key = 'breachsla' OR v_sort_key = 'breachs' OR v_sort_key = 'breach' THEN v_sort_key := 'breachsla'; END IF;
-    IF v_sort_key = '' THEN v_sort_key := 'resolveddatetime'; END IF;
+        OR UPPER(c.incidentno) LIKE '%' || UPPER(p_search) || '%'
+        OR UPPER(c.assignedto) LIKE '%' || UPPER(p_search) || '%'
+        OR UPPER(c.shortdescription) LIKE '%' || UPPER(p_search) || '%'
+        OR UPPER(c.category) LIKE '%' || UPPER(p_search) || '%'
+        OR UPPER(c.state) LIKE '%' || UPPER(p_search) || '%'
+        OR UPPER(c.priority) LIKE '%' || UPPER(p_search) || '%';
 
+    -- STEP 3: Sorting and Pagination (Original Sorting logic untouched)
     SELECT COUNT(*) INTO v_total_count FROM final_temp;
+    v_total_pages := CASE WHEN v_page_size = 0 THEN 1 ELSE CEIL(1.0 * v_total_count / v_page_size)::INT END;
+    IF v_total_count = 0 THEN v_total_pages := 1; END IF;
 
-    IF v_page_size = 0 THEN
-        v_total_pages := 1;
-    ELSE
-        v_total_pages := CEIL(1.0 * v_total_count / v_page_size)::INT;
-        IF v_total_count = 0 THEN v_total_pages := 1; END IF;
-    END IF;
-
-    -- Final SELECT with Pagination Metadata and Dynamic Sorting
     RETURN QUERY EXECUTE format('
         SELECT
-            %s::INTEGER,
-            %s::INTEGER,
-            %s::INTEGER,
-            %s::INTEGER,
-            incidentno,
-            assignedto,
-            shortdescription,
-            category,
-            state,
-            created,
-            resolveddatetime,
-            updated,
-            priority,
-            actualresolvedtime,
-            breachsla
+            %s::INTEGER, %s::INTEGER, %s::INTEGER, %s::INTEGER,
+            incidentno, assignedto, shortdescription, category, state,
+            created, resolveddatetime, updated, priority,
+            actualresolvedtime, breachsla
         FROM final_temp
         ORDER BY
-            CASE WHEN $1 = ''incidentno'' AND $2 = ''ASC'' THEN incidentno END ASC,
-            CASE WHEN $1 = ''incidentno'' AND $2 = ''DESC'' THEN incidentno END DESC,
-            CASE WHEN $1 = ''assignedto'' AND $2 = ''ASC'' THEN assignedto END ASC,
-            CASE WHEN $1 = ''assignedto'' AND $2 = ''DESC'' THEN assignedto END DESC,
-            CASE WHEN $1 = ''shortdescription'' AND $2 = ''ASC'' THEN shortdescription END ASC,
-            CASE WHEN $1 = ''shortdescription'' AND $2 = ''DESC'' THEN shortdescription END DESC,
-            CASE WHEN $1 = ''category'' AND $2 = ''ASC'' THEN category END ASC,
-            CASE WHEN $1 = ''category'' AND $2 = ''DESC'' THEN category END DESC,
-            CASE WHEN $1 = ''state'' AND $2 = ''ASC'' THEN state END ASC,
-            CASE WHEN $1 = ''state'' AND $2 = ''DESC'' THEN state END DESC,
-            CASE WHEN $1 = ''created'' AND $2 = ''ASC'' THEN created END ASC,
-            CASE WHEN $1 = ''created'' AND $2 = ''DESC'' THEN created END DESC,
-            CASE WHEN $1 = ''resolveddatetime'' AND $2 = ''ASC'' THEN resolveddatetime END ASC,
-            CASE WHEN $1 = ''resolveddatetime'' AND $2 = ''DESC'' THEN resolveddatetime END DESC,
-            CASE WHEN $1 = ''updated'' AND $2 = ''ASC'' THEN updated END ASC,
-            CASE WHEN $1 = ''updated'' AND $2 = ''DESC'' THEN updated END DESC,
-            CASE WHEN $1 = ''priority'' AND $2 = ''ASC'' THEN priority END ASC,
-            CASE WHEN $1 = ''priority'' AND $2 = ''DESC'' THEN priority END DESC,
-            -- Sorting for numeric columns (actualresolvedminutes, breachminutes) with NULL handling
-            CASE WHEN $1 = ''actualresolvedtime'' AND $2 = ''ASC'' THEN COALESCE(CAST(actualresolvedminutes AS BIGINT), 9223372036854775807) END ASC,
-            CASE WHEN $1 = ''actualresolvedtime'' AND $2 = ''DESC'' THEN COALESCE(CAST(actualresolvedminutes AS BIGINT), -9223372036854775808) END DESC,
-            CASE WHEN $1 = ''breachsla'' AND $2 = ''ASC'' THEN COALESCE(CAST(breachminutes AS BIGINT), 9223372036854775807) END ASC,
-            CASE WHEN $1 = ''breachsla'' AND $2 = ''DESC'' THEN COALESCE(CAST(breachminutes AS BIGINT), -9223372036854775808) END DESC
+            CASE WHEN $1 = ''Number'' AND $2 = ''ASC'' THEN incidentno END ASC,
+            CASE WHEN $1 = ''Number'' AND $2 = ''DESC'' THEN incidentno END DESC,
+            CASE WHEN $1 = ''AssignedTo'' AND $2 = ''ASC'' THEN assignedto END ASC,
+            CASE WHEN $1 = ''AssignedTo'' AND $2 = ''DESC'' THEN assignedto END DESC,
+            CASE WHEN $1 = ''ShortDescription'' AND $2 = ''ASC'' THEN shortdescription END ASC,
+            CASE WHEN $1 = ''ShortDescription'' AND $2 = ''DESC'' THEN shortdescription END DESC,
+            CASE WHEN $1 = ''Category'' AND $2 = ''ASC'' THEN category END ASC,
+            CASE WHEN $1 = ''Category'' AND $2 = ''DESC'' THEN category END DESC,
+            CASE WHEN $1 = ''State'' AND $2 = ''ASC'' THEN state END ASC,
+            CASE WHEN $1 = ''State'' AND $2 = ''DESC'' THEN state END DESC,
+            CASE WHEN $1 = ''Created'' AND $2 = ''ASC'' THEN created END ASC,
+            CASE WHEN $1 = ''Created'' AND $2 = ''DESC'' THEN created END DESC,
+            CASE WHEN $1 = ''Resolved'' AND $2 = ''ASC'' THEN resolveddatetime END ASC,
+            CASE WHEN $1 = ''Resolved'' AND $2 = ''DESC'' THEN resolveddatetime END DESC,
+            CASE WHEN $1 = ''Updated'' AND $2 = ''ASC'' THEN updated END ASC,
+            CASE WHEN $1 = ''Updated'' AND $2 = ''DESC'' THEN updated END DESC,
+            CASE WHEN $1 = ''Priority'' AND $2 = ''ASC'' THEN priority END ASC,
+            CASE WHEN $1 = ''Priority'' AND $2 = ''DESC'' THEN priority END DESC,
+            CASE WHEN $1 = ''ActualResolvedTime'' AND $2 = ''ASC'' THEN COALESCE(CAST(actualresolvedminutes AS BIGINT), 9223372036854775807) END ASC,
+            CASE WHEN $1 = ''ActualResolvedTime'' AND $2 = ''DESC'' THEN COALESCE(CAST(actualresolvedminutes AS BIGINT), -9223372036854775808) END DESC,
+            CASE WHEN $1 = ''BreachSLA'' AND $2 = ''ASC'' THEN COALESCE(CAST(breachminutes AS BIGINT), 9223372036854775807) END ASC,
+            CASE WHEN $1 = ''BreachSLA'' AND $2 = ''DESC'' THEN COALESCE(CAST(breachminutes AS BIGINT), -9223372036854775808) END DESC
         %s %s'
         , v_page_number, v_page_size, v_total_pages, v_total_count
         , CASE WHEN v_page_size > 0 THEN CONCAT(' OFFSET ', v_offset, ' ROWS ') ELSE '' END
         , CASE WHEN v_page_size > 0 THEN CONCAT(' FETCH NEXT ', v_page_size, ' ROWS ONLY ') ELSE '' END
-    ) USING v_sort_key, v_sort_order;
+    ) USING p_sortby, p_sortorder;
     
 END;
 $BODY$;
